@@ -1,0 +1,160 @@
+From 4a972a90fa0283dcf66a995b1ba2c808c0567bde Mon Sep 17 00:00:00 2001
+From: Robin <trojantale@gmail.com>
+Date: Sun, 22 Nov 2026 12:07:15 +0800
+Subject: [PATCH] spu: redraw active text subtitles when their style changes
+
+Retain the original text region and compare the live font size, foreground color and background settings before using its rasterized picture. Reuse the normal text render path after invalidating the raster and scaled output on a style change. Keep the active subtitle, its timestamps and bitmap subtitle regions intact.
+---
+ include/vlc_subpicture.h            |  2 +
+ src/misc/subpicture.c               |  2 +
+ src/misc/subpicture.h               |  8 ++++
+ src/video_output/vout_subpictures.c | 66 +++++++++++++++++++++++------
+ 4 files changed, 66 insertions(+), 12 deletions(-)
+
+diff --git a/include/vlc_subpicture.h b/include/vlc_subpicture.h
+index 6fd872d..4e57949 100644
+--- a/include/vlc_subpicture.h
++++ b/include/vlc_subpicture.h
+@@ -46,6 +46,7 @@
+  * Video subtitle region spu core private
+  */
+ typedef struct subpicture_region_private_t subpicture_region_private_t;
++typedef struct subpicture_text_cache_t subpicture_text_cache_t;
+ 
+ /**
+  * Video subtitle region
+@@ -75,6 +76,7 @@ struct subpicture_region_t
+ 
+     subpicture_region_t *p_next;                /**< next region in the list */
+     subpicture_region_private_t *p_private;  /**< Private data for spu_t *only* */
++    subpicture_text_cache_t *p_text_cache;   /**< Original text region and cached style */
+ };
+ 
+ /* Subpicture region position flags */
+diff --git a/src/misc/subpicture.c b/src/misc/subpicture.c
+index 23c3cc4..6eff5ea 100644
+--- a/src/misc/subpicture.c
++++ b/src/misc/subpicture.c
+@@ -270,6 +270,8 @@ void subpicture_region_Delete( subpicture_region_t *p_region )
+     if( p_region->p_private )
+         subpicture_region_private_Delete( p_region->p_private );
+ 
++    free( p_region->p_text_cache );
++
+     if( p_region->p_picture )
+         picture_Release( p_region->p_picture );
+ 
+diff --git a/src/misc/subpicture.h b/src/misc/subpicture.h
+index 9615030..e2f3654 100644
+--- a/src/misc/subpicture.h
++++ b/src/misc/subpicture.h
+@@ -26,6 +26,14 @@ struct subpicture_region_private_t {
+     picture_t      *p_picture;
+ };
+ 
++enum { SUBPICTURE_TEXT_STYLE_COUNT = 4 };
++
++struct subpicture_text_cache_t {
++    video_format_t format;
++    int x, y;
++    int64_t style[SUBPICTURE_TEXT_STYLE_COUNT];
++};
++
+ subpicture_region_private_t *subpicture_region_private_New(video_format_t *);
+ void subpicture_region_private_Delete(subpicture_region_private_t *);
+ 
+diff --git a/src/video_output/vout_subpictures.c b/src/video_output/vout_subpictures.c
+index 68dde84..8927546 100644
+--- a/src/video_output/vout_subpictures.c
++++ b/src/video_output/vout_subpictures.c
+@@ -651,9 +651,54 @@ static void SpuSelectSubpictures(spu_t *spu,
+ 
+ 
+ 
+-/**
+- * It will transform the provided region into another region suitable for rendering.
+- */
++static void SpuRestoreTextRegion(subpicture_region_t *region,
++                                 const video_format_t *format, int x, int y)
++{
++    if (region->p_picture) {
++        picture_Release(region->p_picture);
++        region->p_picture = NULL;
++    }
++    if (region->p_private) {
++        subpicture_region_private_Delete(region->p_private);
++        region->p_private = NULL;
++    }
++    // The original VLC_CODEC_TEXT format owns no palette.
++    video_format_Clean(&region->fmt);
++    region->fmt = *format;
++    region->i_x = x;
++    region->i_y = y;
++}
++
++static void SpuUpdateTextStyle(filter_t *text, subpicture_region_t *region)
++{
++    subpicture_text_cache_t *cache = region->p_text_cache;
++    if (!text || !region->p_text ||
++        (!cache && (region->fmt.i_chroma != VLC_CODEC_TEXT || region->fmt.p_palette)))
++        return;
++
++    const int64_t style[SUBPICTURE_TEXT_STYLE_COUNT] = {
++        var_InheritInteger(text, "freetype-rel-fontsize"),
++        var_InheritInteger(text, "freetype-color"),
++        var_InheritInteger(text, "freetype-background-color"),
++        var_InheritInteger(text, "freetype-background-opacity"),
++    };
++    if (cache) {
++        if (!memcmp(cache->style, style, sizeof(style)))
++            return;
++        SpuRestoreTextRegion(region, &cache->format, cache->x, cache->y);
++    } else {
++        cache = malloc(sizeof(*cache));
++        if (!cache)
++            return;
++        cache->format = region->fmt;
++        cache->x = region->i_x;
++        cache->y = region->i_y;
++        region->p_text_cache = cache;
++    }
++    memcpy(cache->style, style, sizeof(style));
++}
++
++/** Transform the provided region into a region suitable for rendering. */
+ static void SpuRenderRegion(spu_t *spu,
+                             subpicture_region_t **dst_ptr, spu_area_t *dst_area,
+                             subpicture_t *subpic, subpicture_region_t *region,
+@@ -665,7 +710,12 @@ static void SpuRenderRegion(spu_t *spu,
+ {
+     spu_private_t *sys = spu->p;
+ 
++    if (subpic->b_subtitle)
++        SpuUpdateTextStyle(sys->text, region);
++
+     video_format_t fmt_original = region->fmt;
++    const int original_x = region->i_x;
++    const int original_y = region->i_y;
+     bool restore_text = false;
+     int x_offset;
+     int y_offset;
+@@ -987,15 +1037,7 @@ exit:
+          * pre-rendered state, so the next time through everything is
+          * calculated again.
+          */
+-        if (region->p_picture) {
+-            picture_Release(region->p_picture);
+-            region->p_picture = NULL;
+-        }
+-        if (region->p_private) {
+-            subpicture_region_private_Delete(region->p_private);
+-            region->p_private = NULL;
+-        }
+-        region->fmt = fmt_original;
++        SpuRestoreTextRegion(region, &fmt_original, original_x, original_y);
+     }
+ }
+ 
+-- 
+2.54.0 (Apple Git-157)
+
