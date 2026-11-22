@@ -1,0 +1,150 @@
+From 808e6380ca319ccb5538d5bdd695ed553d0c23fb Mon Sep 17 00:00:00 2001
+From: Robin <trojantale@gmail.com>
+Date: Sun, 22 Nov 2026 12:52:55 +0800
+Subject: [PATCH] spu: preserve relative subtitle placement when redrawing
+
+The first successful layout stores absolute coordinates. When style changes, compute placement again from the original relative anchor and cache the resulting absolute position for subsequent frames.
+---
+ src/misc/subpicture.h               |  1 +
+ src/video_output/vout_subpictures.c | 49 ++++++++++++++++-------------
+ 2 files changed, 28 insertions(+), 22 deletions(-)
+
+diff --git a/src/misc/subpicture.h b/src/misc/subpicture.h
+index e2f3654..236f7cb 100644
+--- a/src/misc/subpicture.h
++++ b/src/misc/subpicture.h
+@@ -31,6 +31,7 @@ enum { SUBPICTURE_TEXT_STYLE_COUNT = 4 };
+ struct subpicture_text_cache_t {
+     video_format_t format;
+     int x, y;
++    bool absolute;
+     int64_t style[SUBPICTURE_TEXT_STYLE_COUNT];
+ };
+ 
+diff --git a/src/video_output/vout_subpictures.c b/src/video_output/vout_subpictures.c
+index 8927546..ed05059 100644
+--- a/src/video_output/vout_subpictures.c
++++ b/src/video_output/vout_subpictures.c
+@@ -452,10 +452,10 @@ static void SpuAreaFitInside(spu_area_t *area, const spu_area_t *boundary)
+  */
+ static void SpuRegionPlace(int *x, int *y,
+                            const subpicture_t *subpic,
+-                           const subpicture_region_t *region)
++                           const subpicture_region_t *region, bool absolute)
+ {
+     assert(region->i_x != INT_MAX && region->i_y != INT_MAX);
+-    if (subpic->b_absolute) {
++    if (absolute) {
+         *x = region->i_x;
+         *y = region->i_y;
+     } else {
+@@ -669,12 +669,13 @@ static void SpuRestoreTextRegion(subpicture_region_t *region,
+     region->i_y = y;
+ }
+ 
+-static void SpuUpdateTextStyle(filter_t *text, subpicture_region_t *region)
++/* Returns true when a relative region needs to be placed again after redraw. */
++static bool SpuUpdateTextStyle(filter_t *text, subpicture_region_t *region, bool absolute)
+ {
+     subpicture_text_cache_t *cache = region->p_text_cache;
+     if (!text || !region->p_text ||
+         (!cache && (region->fmt.i_chroma != VLC_CODEC_TEXT || region->fmt.p_palette)))
+-        return;
++        return false;
+ 
+     const int64_t style[SUBPICTURE_TEXT_STYLE_COUNT] = {
+         var_InheritInteger(text, "freetype-rel-fontsize"),
+@@ -684,18 +685,22 @@ static void SpuUpdateTextStyle(filter_t *text, subpicture_region_t *region)
+     };
+     if (cache) {
+         if (!memcmp(cache->style, style, sizeof(style)))
+-            return;
++            return false;
+         SpuRestoreTextRegion(region, &cache->format, cache->x, cache->y);
+-    } else {
+-        cache = malloc(sizeof(*cache));
+-        if (!cache)
+-            return;
+-        cache->format = region->fmt;
+-        cache->x = region->i_x;
+-        cache->y = region->i_y;
+-        region->p_text_cache = cache;
++        memcpy(cache->style, style, sizeof(style));
++        return !cache->absolute;
+     }
++
++    cache = malloc(sizeof(*cache));
++    if (!cache)
++        return false;
++    cache->format = region->fmt;
++    cache->x = region->i_x;
++    cache->y = region->i_y;
++    cache->absolute = absolute;
+     memcpy(cache->style, style, sizeof(style));
++    region->p_text_cache = cache;
++    return false;
+ }
+ 
+ /** Transform the provided region into a region suitable for rendering. */
+@@ -706,13 +711,10 @@ static void SpuRenderRegion(spu_t *spu,
+                             const vlc_fourcc_t *chroma_list,
+                             const video_format_t *fmt,
+                             const spu_area_t *subtitle_area, int subtitle_area_count,
+-                            vlc_tick_t render_date)
++                            vlc_tick_t render_date, bool absolute)
+ {
+     spu_private_t *sys = spu->p;
+ 
+-    if (subpic->b_subtitle)
+-        SpuUpdateTextStyle(sys->text, region);
+-
+     video_format_t fmt_original = region->fmt;
+     const int original_x = region->i_x;
+     const int original_y = region->i_y;
+@@ -767,8 +769,7 @@ static void SpuRenderRegion(spu_t *spu,
+ 
+     /* Place the picture
+      * We compute the position in the rendered size */
+-    SpuRegionPlace(&x_offset, &y_offset,
+-                   subpic, region);
++    SpuRegionPlace(&x_offset, &y_offset, subpic, region, absolute);
+ 
+     /* Save this position for subtitle overlap support
+      * it is really important that there are given without scale_size applied */
+@@ -778,7 +779,7 @@ static void SpuRenderRegion(spu_t *spu,
+                                 scale_size);
+ 
+     /* Handle overlapping subtitles when possible */
+-    if (subpic->b_subtitle && !subpic->b_absolute)
++    if (subpic->b_subtitle && !absolute)
+         SpuAreaFixOverlap(dst_area, subtitle_area, subtitle_area_count,
+                           region->i_align);
+ 
+@@ -1155,18 +1156,22 @@ static subpicture_t *SpuRenderSubpictures(spu_t *spu,
+             if (scale.w <= 0 || scale.h <= 0)
+                 continue;
+ 
++            const bool place_again = subpic->b_subtitle &&
++                SpuUpdateTextStyle(sys->text, region, subpic->b_absolute);
++            const bool absolute = subpic->b_absolute && !place_again;
++
+             /* */
+             SpuRenderRegion(spu, output_last_ptr, &area,
+                             subpic, region, scale,
+                             chroma_list, fmt_dst,
+                             subtitle_area, subtitle_area_count,
+-                            subpic->b_subtitle ? render_subtitle_date : render_osd_date);
++                            subpic->b_subtitle ? render_subtitle_date : render_osd_date, absolute);
+             if (*output_last_ptr)
+                 output_last_ptr = &(*output_last_ptr)->p_next;
+ 
+             if (subpic->b_subtitle) {
+                 area = spu_area_unscaled(area, scale);
+-                if (!subpic->b_absolute && area.width > 0 && area.height > 0) {
++                if (!absolute && area.width > 0 && area.height > 0) {
+                     region->i_x = area.x;
+                     region->i_y = area.y;
+                 }
+-- 
+2.54.0 (Apple Git-157)
+
